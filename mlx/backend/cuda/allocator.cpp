@@ -310,10 +310,47 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   return Buffer{buf};
 }
 
+static bool memory_trace_enabled();
+
+// Trimming is the only step that turns pool reservation back into device
+// memory, so whether it moves a byte is the single most load-bearing fact in
+// this allocator -- and two runs in a row ended with `pool_reserved` frozen at
+// byte-identical 44560285696 despite hundreds of trims. Report the reservation
+// either side of the call so the trace answers that directly instead of
+// leaving it to be inferred from the figures a later allocation happens to
+// print.
 void CudaAllocator::trim_pools() {
+  bool trace = memory_trace_enabled();
   for (auto p : mem_pools_) {
     if (p) {
+      size_t before = 0;
+      if (trace) {
+        cudaMemPoolGetAttribute(p, cudaMemPoolAttrReservedMemCurrent, &before);
+      }
       CHECK_CUDA_ERROR(cudaMemPoolTrimTo(p, 0));
+      if (trace) {
+        size_t after = 0;
+        size_t used = 0;
+        size_t free = 0;
+        size_t total = 0;
+        cudaMemPoolGetAttribute(p, cudaMemPoolAttrReservedMemCurrent, &after);
+        cudaMemPoolGetAttribute(p, cudaMemPoolAttrUsedMemCurrent, &used);
+        cudaMemGetInfo(&free, &total);
+        static std::atomic<size_t> seen{0};
+        size_t n = seen.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16 || n % 64 == 0) {
+          fmt::print(
+              stderr,
+              "[mlx][cuda-mem] trim n={} reserved={}->{} released={} "
+              "pool_used={} free={}\n",
+              n,
+              before,
+              after,
+              before > after ? before - after : 0,
+              used,
+              free);
+        }
+      }
     }
   }
 }
