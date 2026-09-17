@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 
@@ -170,6 +171,11 @@ CudaAllocator::CudaAllocator()
       CHECK_CUDA_ERROR(cudaDeviceGetDefaultMemPool(&mem_pools_[i], i));
     }
   }
+
+  // The baseline every later line is read against: what the device had already
+  // handed out before this allocator took a single byte.
+  static std::atomic<size_t> seen{0};
+  trace_device_memory("construct", seen, 0);
 }
 
 Buffer
@@ -239,6 +245,11 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
       } else {
         cu::device(device).make_current();
         if (mem_pools_[device]) { // supports memory pools
+          // A timeline of the device split across a run, so the trace shows
+          // how foreign memory grows between the step that works and the step
+          // that dies -- not only the moment it has already gone wrong.
+          static std::atomic<size_t> seen{0};
+          trace_device_memory("malloc", seen, size);
           wait_for_physical_memory(size, device);
           CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
         } else {
@@ -299,7 +310,76 @@ void CudaAllocator::trim_pools() {
   }
 }
 
+// Every figure the allocator reports about itself -- active, cache, peak,
+// limit -- describes only what it allocated. What decides whether the next
+// graph instantiation succeeds is the device's own free figure and how much
+// of the card is held by consumers this allocator never sees. Set
+// MLX_CUDA_MEMORY_TRACE=1 to have both printed at the moments that matter:
+// when the device refuses an allocation, and when a wait gives up and
+// allocates anyway. Rate-limited, because a failing run produces thousands.
+static bool memory_trace_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_CUDA_MEMORY_TRACE");
+    return v && *v && *v != '0';
+  }();
+  return enabled;
+}
+
+void CudaAllocator::trace_device_memory(
+    const char* where,
+    std::atomic<size_t>& seen,
+    size_t size) {
+  if (!memory_trace_enabled()) {
+    return;
+  }
+  size_t n = seen.fetch_add(1, std::memory_order_relaxed);
+  if (n >= 32 && n % 256 != 0) {
+    return;
+  }
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 ||
+      static_cast<size_t>(device) >= mem_pools_.size()) {
+    return;
+  }
+  size_t free = 0;
+  size_t total = 0;
+  size_t reserved = 0;
+  size_t used = 0;
+  cudaMemGetInfo(&free, &total);
+  if (auto pool = mem_pools_[device]) {
+    cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+    cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used);
+  }
+  size_t held = total - free;
+  // Everything the device has handed out that did not come from this pool.
+  // This is the figure no other diagnostic in the stack reports, and the one
+  // the reserve is trying to predict.
+  size_t foreign = held > reserved ? held - reserved : 0;
+  fmt::print(
+      stderr,
+      "[mlx][cuda-mem] {} n={} size={} free={} total={} pool_reserved={} "
+      "pool_used={} foreign={} reserve={} active={} cache={} limit={}\n",
+      where,
+      n,
+      size,
+      free,
+      total,
+      reserved,
+      used,
+      foreign,
+      foreign_reserve_.load(std::memory_order_relaxed),
+      active_memory_,
+      get_cache_memory(),
+      memory_limit_);
+}
+
 void CudaAllocator::raise_reserve(size_t reserve) {
+  // Half the card bounds what a measurement is allowed to claim. A sample
+  // taken while another process holds most of the device would otherwise set a
+  // reserve that makes the precondition it feeds permanently unsatisfiable,
+  // turning every allocation into a release-and-trim no-op instead of
+  // backpressure.
+  reserve = std::min(reserve, total_memory_ / 2);
   size_t current = foreign_reserve_.load(std::memory_order_relaxed);
   while (reserve > current &&
          !foreign_reserve_.compare_exchange_weak(
@@ -307,17 +387,18 @@ void CudaAllocator::raise_reserve(size_t reserve) {
   }
 }
 
-// The device refusing an allocation is the one measurement sampling can never
-// make: a sample sees the allocations outside this pool that succeeded, never
-// the one that failed. So treat the refusal as the measurement it is and grow
-// the reserve, so whatever retries finds the room this attempt did not. The
-// step is a fraction of the reserve rather than a constant because the right
-// figure is a property of the card and the graphs a run instantiates, and a
-// few refusals converge on it from a measured starting point instead of
-// guessing it up front.
+// A refusal is the one moment sampling can never reach on its own: a sample
+// sees the out-of-pool allocations that succeeded, never the one that failed.
+// Take the device's split here, where it is the split that actually decided
+// the outcome. Deliberately no growth heuristic: an earlier version raised the
+// reserve by a fraction of itself on every refusal, and a failing step
+// produces thousands of them, so the reserve saturated within seconds and made
+// every subsequent allocation fall through the wait unconditionally. The size
+// the reserve should be is a measurement to read off this trace, not a number
+// to converge on by guessing.
 void CudaAllocator::report_out_of_memory() {
-  size_t current = foreign_reserve_.load(std::memory_order_relaxed);
-  raise_reserve(current + current / 4 + page_size);
+  static std::atomic<size_t> seen{0};
+  trace_device_memory("refused", seen, 0);
 }
 
 // Report what the device can still hand out, keeping the two kinds of room
@@ -379,6 +460,8 @@ void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
     std::lock_guard lock(mutex_);
     buffer_cache_.release_cached_buffers(get_cache_memory());
     trim_pools();
+    static std::atomic<size_t> seen{0};
+    trace_device_memory("fallthrough", seen, size);
   }
 }
 
