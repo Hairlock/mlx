@@ -151,6 +151,10 @@ CudaAllocator::CudaAllocator()
   // above all -- is never ours to allocate, so a limit derived from the total
   // alone is a limit that can never be reached. Clamp to what is actually
   // free, and let the difference widen the reserve `free_limit_` protects.
+  // Nothing is ours yet, so everything the device has already handed out is
+  // the first measurement of what never will be. Seeding the high-water mark
+  // here is what stops a caller's `set_memory_limit` from claiming it back.
+  foreign_peak_ = total_memory_ - free;
   memory_limit_ = std::min(static_cast<size_t>(total_memory_ * 0.95), free);
   free_limit_ = total_memory_ - memory_limit_;
   max_pool_size_ = memory_limit_;
@@ -294,6 +298,51 @@ void CudaAllocator::trim_pools() {
   }
 }
 
+// The memory limit is a claim about how much of the device is ours, and a
+// fixed fraction of the device total is a guess at that claim rather than a
+// measurement of it. What the claim has to exclude is everything holding
+// device memory outside this pool: the CUDA context, NVRTC modules, cuDNN
+// workspaces, instantiated graph executables. That figure measured about
+// 4.8 GB on an L40S, against the 2.4 GB a 0.95 fraction leaves, which is how
+// a run peaks under its own limit and over what the card has left. It is also
+// a different number on the next card and grows as a run instantiates more
+// graphs, so no constant is right either. Measure it on every sample, keep
+// the high-water mark, and let the limit follow it down -- never back up,
+// since rising again would hand back headroom the measurement just proved
+// another consumer needs.
+size_t CudaAllocator::observe_device_memory(int device) {
+  auto pool = mem_pools_[device];
+  size_t free = 0;
+  size_t total = 0;
+  CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total));
+  size_t reserved = 0;
+  size_t used = 0;
+  CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
+      pool, cudaMemPoolAttrReservedMemCurrent, &reserved));
+  CHECK_CUDA_ERROR(
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
+
+  // Resident managed memory and the scalar pool land on the foreign side of
+  // this subtraction because they do not come from the async pool. Both are
+  // small, and counting them as someone else's only makes the limit lower
+  // than it strictly has to be, which is the direction that is safe to be
+  // wrong in.
+  size_t held = total - free;
+  size_t foreign = held > reserved ? held - reserved : 0;
+  if (foreign > foreign_peak_) {
+    std::lock_guard lock(mutex_);
+    foreign_peak_ = foreign;
+    size_t bound =
+        total_memory_ > foreign_peak_ ? total_memory_ - foreign_peak_ : 0;
+    if (bound < memory_limit_) {
+      memory_limit_ = bound;
+      free_limit_ = total_memory_ - memory_limit_;
+      max_pool_size_ = std::min(max_pool_size_, memory_limit_);
+    }
+  }
+  return free + (reserved - used);
+}
+
 // The memory limit bounds what this allocator counts, not what the device
 // holds: the CUDA context, instantiated graph executables and pool
 // fragmentation all sit on top of it. When neither the pool's reserved
@@ -302,19 +351,7 @@ void CudaAllocator::trim_pools() {
 // Hand cached buffers back to the pool and wait for in-flight work instead,
 // for as long as there is work to wait for.
 void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
-  auto pool = mem_pools_[device];
-  auto available = [pool]() {
-    size_t free = 0;
-    size_t total = 0;
-    CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total));
-    size_t reserved = 0;
-    size_t used = 0;
-    CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
-        pool, cudaMemPoolAttrReservedMemCurrent, &reserved));
-    CHECK_CUDA_ERROR(
-        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
-    return free + (reserved - used);
-  };
+  auto available = [this, device]() { return observe_device_memory(device); };
   while (available() < size && scheduler::n_active_tasks() > 0) {
     {
       std::lock_guard lock(mutex_);
@@ -426,9 +463,19 @@ size_t CudaAllocator::get_memory_limit() {
   return memory_limit_;
 }
 
+// A caller asking for a limit is expressing a budget, not a fact about the
+// device. Honour it only down to what the device has actually left us: a
+// framework that computes its ceiling from the device total would otherwise
+// undo the constructor's clamp and every tightening `observe_device_memory`
+// has made, and get back the out-of-memory those measurements exist to
+// prevent. Returns the limit that was in force.
 size_t CudaAllocator::set_memory_limit(size_t limit) {
   std::lock_guard lock(mutex_);
+  size_t bound =
+      total_memory_ > foreign_peak_ ? total_memory_ - foreign_peak_ : 0;
+  limit = std::min(limit, bound);
   std::swap(limit, memory_limit_);
+  free_limit_ = total_memory_ - memory_limit_;
   return limit;
 }
 

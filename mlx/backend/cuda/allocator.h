@@ -72,6 +72,10 @@ class CudaAllocator : public allocator::Allocator {
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
   // Called without mutex_ held, with |device| current.
   void wait_for_physical_memory(size_t size, int device);
+  // Sample what the device has actually handed out, tighten `memory_limit_`
+  // to exclude the part of it that is not ours, and return what |device|'s
+  // pool can still serve. Called without mutex_ held.
+  size_t observe_device_memory(int device);
   // Return every memory pool's unused reservation to the device. Freeing a
   // buffer hands it back to the CUDA async pool, which keeps the pages
   // reserved for its own future allocations; anything that allocates outside
@@ -92,6 +96,10 @@ class CudaAllocator : public allocator::Allocator {
   BufferCache<CudaBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
+  // High-water mark of device memory held by everything that is not this
+  // allocator's pool. Only ever grows, and `memory_limit_` only ever falls
+  // to stay under it.
+  size_t foreign_peak_{0};
   std::vector<CudaStream> free_streams_;
   std::vector<cudaMemPool_t> mem_pools_;
   SmallSizePool scalar_pool_;
