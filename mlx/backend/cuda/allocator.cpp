@@ -274,7 +274,20 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
           static std::atomic<size_t> seen{0};
           trace_device_memory("malloc", seen, size);
           wait_for_physical_memory(size, device);
-          CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
+          // Not CHECK_CUDA_ERROR: its message is the call expression, which
+          // reaches the user as a bare "out of memory" and answers none of
+          // the questions a fix needs.
+          if (auto err = cudaMallocAsync(&data, size, stream);
+              err != cudaSuccess) {
+            if (err == cudaErrorMemoryAllocation) {
+              // Same feedback CHECK_CUDA_ERROR would have given: the refusal
+              // is the one measurement of what consumers outside the pool
+              // need, and whatever retries should see it.
+              report_out_of_memory();
+            }
+            throw std::runtime_error(
+                describe_allocation_failure(size, device, err));
+          }
         } else {
           CHECK_CUDA_ERROR(cudaMalloc(&data, size));
         }
@@ -459,6 +472,40 @@ void CudaAllocator::trace_device_memory(
       reserved,
       used,
       foreign,
+      free_limit_.load(std::memory_order_relaxed),
+      active_memory_,
+      get_cache_memory(),
+      memory_limit());
+}
+
+std::string CudaAllocator::describe_allocation_failure(
+    size_t size,
+    int device,
+    cudaError_t err) {
+  size_t free = 0;
+  size_t total = 0;
+  size_t reserved = 0;
+  size_t used = 0;
+  cudaMemGetInfo(&free, &total);
+  if (device >= 0 && static_cast<size_t>(device) < mem_pools_.size()) {
+    if (auto pool = mem_pools_[device]) {
+      cudaMemPoolGetAttribute(
+          pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used);
+    }
+  }
+  const char* tag = current_primitive_tag();
+  return fmt::format(
+      "[malloc] Device {} refused {} bytes for {}: {}. free={} total={} "
+      "pool_reserved={} pool_used={} reserve={} active={} cache={} limit={}",
+      device,
+      size,
+      tag ? tag : "no primitive (graph construction or copy-in)",
+      cudaGetErrorString(err),
+      free,
+      total,
+      reserved,
+      used,
       free_limit_.load(std::memory_order_relaxed),
       active_memory_,
       get_cache_memory(),

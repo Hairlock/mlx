@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 
 namespace mlx::core::cu {
@@ -95,14 +96,22 @@ class CudaAllocator : public allocator::Allocator {
   // another will retake.
   void raise_reserve(size_t reserve);
   // Print the device-side memory split to stderr under MLX_CUDA_MEMORY_TRACE.
-  // Non-throwing and rate-limited -- the first 32 events then every 256th --
-  // because it runs on paths a failing run reaches thousands of times. |seen|
-  // is the call site's own counter, so a site that fires rarely is not crowded
-  // out of the trace by one that fires constantly.
+  // Non-throwing and rate-limited -- the first 32 events then every 256th,
+  // except that anything large enough to decide the run on its own is always
+  // printed -- because it runs on paths a failing run reaches thousands of
+  // times. |seen| is the call site's own counter, so a site that fires rarely
+  // is not crowded out of the trace by one that fires constantly.
   void trace_device_memory(
       const char* where,
       std::atomic<size_t>& seen,
       size_t size);
+  // The message for an allocation the device refused. "out of memory" alone
+  // says nothing actionable: what decides a fix is how much was asked for,
+  // which primitive asked, and how the card was split at that instant --
+  // specifically whether the pool was holding the room the request needed.
+  // Non-throwing; runs on the error path.
+  std::string
+  describe_allocation_failure(size_t size, int device, cudaError_t err);
   // Return every memory pool's unused reservation to the device. Freeing a
   // buffer hands it back to the CUDA async pool, which keeps the pages
   // reserved for its own future allocations; anything that allocates outside
