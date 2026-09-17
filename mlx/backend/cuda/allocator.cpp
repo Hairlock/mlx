@@ -266,35 +266,33 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     }
     lock.lock();
 
-    // If any cuda memory pool has too much reserved memory, clear some
-    // memory from the cache. This prevents graph / kernel execution failing
-    // from OOM.
+    // If the device has dropped below the reserve, hand the cache back and
+    // trim. This is what keeps graph instantiation and kernel launch resources
+    // -- none of which allocate from this pool -- from failing with an
+    // out-of-memory the pool's own statistics contradict.
     //
     // Releasing cached buffers alone cannot do that: a released buffer is
     // handed back to the async pool, which keeps its pages reserved, so the
-    // reserved figure this very condition tests is unchanged by the release.
-    // Trimming is the step that turns the freed reservation back into device
-    // memory a graph instantiation or a kernel's launch resources can use.
+    // device's free figure is unchanged by the release. Trimming is the step
+    // that turns the freed reservation back into device memory those consumers
+    // can reach.
     //
-    // This cap is the only thing in the allocator that decides how much of the
-    // card stays genuinely free, which makes `free_limit_` the figure the
-    // failure mode above actually turns on -- not the memory limit, not the
-    // cache limit. Measured on an L40S it had to be a measurement rather than
-    // the fixed twentieth of the card it used to be: the pool settled at
-    // exactly the memory limit in reserved pages with 4-15 GB of that idle,
-    // the device was left 1.79 GB free, and the next graph launch wanted more.
+    // The condition is asked of the device rather than of the pool's reserved
+    // figure, because the two are not related by `total_memory_` alone. What
+    // the device actually has free is `total - pool_reserved - foreign`, and an
+    // earlier version of this gate tested `pool_reserved > total - reserve`,
+    // which therefore only ever delivered `reserve - foreign` of free memory --
+    // short by the foreign term on every run, measured on an L40S as a 3.17 GB
+    // reserve that left the device 2.38 GB. Reading `free` directly is the same
+    // measurement the reserve's own growth rule already uses, and it carries
+    // the foreign term and pool fragmentation without this allocator having to
+    // account for either.
     size_t reserve = free_limit_.load(std::memory_order_relaxed);
-    for (auto p : mem_pools_) {
-      if (p) {
-        size_t reserved = 0;
-        CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
-            p, cudaMemPoolAttrReservedMemCurrent, &reserved));
-        if (reserved > (total_memory_ - reserve)) {
-          buffer_cache_.release_cached_buffers(reserve);
-          trim_pools();
-          break;
-        }
-      }
+    size_t free = 0;
+    size_t total = 0;
+    if (cudaMemGetInfo(&free, &total) == cudaSuccess && free < reserve) {
+      buffer_cache_.release_cached_buffers(reserve);
+      trim_pools();
     }
   }
   active_memory_ += buf->size;
@@ -430,50 +428,52 @@ void CudaAllocator::report_out_of_memory() {
   raise_reserve(free + free / 4 + page_size);
 }
 
-// Report what the device can still hand out, keeping the two kinds of room
-// apart: the pool's unused reservation is already off the device's free list,
-// so spending it costs no free memory and only `cudaMallocAsync` can do it,
-// while anything else has to come out of free memory that every consumer
-// competes for. Sampling doubles as a measurement of the reserve -- whatever
-// the device holds beyond this allocator's reservation belongs to consumers
-// the pool cannot serve, so a sample showing more of it than the reserve holds
-// back proves the reserve too small. Resident managed memory and the scalar
-// pool land on that side of the subtraction too; both are small, and counting
-// them here only makes the reserve larger than it strictly has to be, which is
-// the direction that is safe to be wrong in.
-CudaAllocator::Availability CudaAllocator::observe_device_memory(int device) {
+// Report what the device can still hand out to anyone, and take a measurement
+// of the reserve while the numbers are in hand: whatever the device holds
+// beyond this allocator's own reservation belongs to consumers the pool cannot
+// serve, so a sample showing more of it than the reserve holds back proves the
+// reserve too small. Resident managed memory and the scalar pool land on that
+// side of the subtraction too; both are small, and counting them here only
+// makes the reserve larger than it strictly has to be, which is the direction
+// that is safe to be wrong in.
+size_t CudaAllocator::observe_device_memory(int device) {
   auto pool = mem_pools_[device];
   size_t free = 0;
   size_t total = 0;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total));
   size_t reserved = 0;
-  size_t used = 0;
   CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
       pool, cudaMemPoolAttrReservedMemCurrent, &reserved));
-  CHECK_CUDA_ERROR(
-      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
 
   size_t held = total - free;
   raise_reserve(held > reserved ? held - reserved : 0);
-  return Availability{free, reserved - used};
+  return free;
 }
 
 // The memory limit bounds what this allocator counts, not what the device
 // holds: the CUDA context, instantiated graph executables and pool
-// fragmentation all sit on top of it. An allocation is safe only once the
-// device can serve it without eating into the reserve -- either out of the
-// pool's own reservation, which costs no free memory, or out of free memory
-// with the reserve still left behind. Counting the reservation as available
-// for any allocation, as an earlier version of this did, is what lets a run
-// fill the card to the last byte of its pool and then die on the next graph
-// launch with an out-of-memory the pool's own statistics contradict. Hand
-// cached buffers back to the device and wait for in-flight work instead, for
-// as long as there is work to wait for.
+// fragmentation all sit on top of it. So the only figure worth testing here is
+// the device's own free memory, which already contains every one of those
+// consumers without this allocator having to model any of them.
+//
+// Idle reservation inside the pool is deliberately not counted as available,
+// though an earlier version of this did count it. Two measurements killed that
+// idea. It is not sound: a run died on an 80 MB `cudaMallocAsync` while the
+// pool held 13.56 GB reserved-but-unused, because reuse is stream-ordered and
+// idle blocks belong to whichever stream freed them. And counting it is what
+// disables this function entirely -- a pool with gigabytes idle answers "yes"
+// to every request, so the loop below never runs, the cache is never handed
+// back, in-flight work is never drained, and the device is free to sit below
+// its reserve indefinitely. That short-circuit is also why trimming looked
+// powerless: the only trims left running were the ones against a hot pool
+// where nearly every granule still holds something live. The trim that
+// reclaims is the one after `wait_for_completion` has drained the work that
+// was pinning those granules, and reaching it requires asking the device --
+// not the pool -- whether there is room.
 void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
   auto servable = [this, device, size]() {
-    auto avail = observe_device_memory(device);
-    return avail.pooled >= size ||
-        avail.free >= size + free_limit_.load(std::memory_order_relaxed);
+    size_t free = observe_device_memory(device);
+    return free >= size + free_limit_.load(std::memory_order_relaxed);
   };
   while (!servable() && scheduler::n_active_tasks() > 0) {
     {

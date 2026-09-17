@@ -71,10 +71,10 @@ class CudaAllocator : public allocator::Allocator {
   size_t get_cache_memory() const;
   size_t set_cache_limit(size_t limit);
   void clear_cache();
-  // Record that the device refused an allocation: the one moment the split
-  // between pooled and free device memory can be read at the instant it
-  // decided the outcome. Never throws, never takes mutex_: it runs on the
-  // error path, where the caller may hold it.
+  // Record that the device refused an allocation: the one moment the free
+  // memory a consumer outside this pool actually needed can be read, at the
+  // instant it decided the outcome. Never throws, never takes mutex_: it runs
+  // on the error path, where the caller may hold it.
   void report_out_of_memory();
 
  private:
@@ -82,17 +82,14 @@ class CudaAllocator : public allocator::Allocator {
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
   // Called without mutex_ held, with |device| current.
   void wait_for_physical_memory(size_t size, int device);
-  // What the device can still hand out, split by who is able to take it.
-  // |pooled| is this allocator's own unused reservation, which only
-  // `cudaMallocAsync` on |device| can draw on; |free| is device memory nobody
-  // holds, which every consumer can. Sampling also raises `free_limit_` when
-  // the sample shows more memory held outside the pool than the reserve
-  // currently accounts for. Called without mutex_ held.
-  struct Availability {
-    size_t free;
-    size_t pooled;
-  };
-  Availability observe_device_memory(int device);
+  // Device memory nobody holds -- the only room every consumer can reach, and
+  // so the only figure worth gating an allocation on. The pool's own unused
+  // reservation is deliberately not reported alongside it: it is off the
+  // device's free list, and stream-ordered reuse means it cannot be counted on
+  // to serve an arbitrary request even when it dwarfs one. Sampling also raises
+  // `free_limit_` when it shows more memory held outside the pool than the
+  // reserve currently accounts for. Called without mutex_ held.
+  size_t observe_device_memory(int device);
   // Raise `free_limit_` to |reserve| if it is larger, bounded by half the
   // card. Lock-free: the reserve only ever grows, so a lost race is a sample
   // another will retake.
