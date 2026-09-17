@@ -142,6 +142,27 @@ class CudaAllocator : public allocator::Allocator {
   SmallSizePool scalar_pool_;
 };
 
+// The allocator only ever sees a byte count, so a trace of a run that ran out
+// of memory says how big the allocation was and nothing about who asked for
+// it. Every eval names the primitive it is about to run; record that name for
+// the duration of the call so each traced allocation can carry its culprit.
+// Null outside an eval (a graph-construction or copy-in allocation).
+const char* current_primitive_tag();
+
+// Sets the tag for the enclosing scope and restores the previous one, so
+// nested evals (a primitive that evaluates sub-arrays) unwind correctly.
+class PrimitiveTagScope {
+ public:
+  explicit PrimitiveTagScope(const char* name);
+  ~PrimitiveTagScope();
+
+  PrimitiveTagScope(const PrimitiveTagScope&) = delete;
+  PrimitiveTagScope& operator=(const PrimitiveTagScope&) = delete;
+
+ private:
+  const char* previous_;
+};
+
 CudaAllocator& allocator();
 
 // Whether `allocator()`'s singleton has finished constructing. Consulted by

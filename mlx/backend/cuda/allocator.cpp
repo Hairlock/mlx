@@ -392,6 +392,23 @@ static bool memory_trace_enabled() {
   return enabled;
 }
 
+namespace {
+thread_local const char* primitive_tag = nullptr;
+} // namespace
+
+const char* current_primitive_tag() {
+  return primitive_tag;
+}
+
+PrimitiveTagScope::PrimitiveTagScope(const char* name)
+    : previous_(primitive_tag) {
+  primitive_tag = name;
+}
+
+PrimitiveTagScope::~PrimitiveTagScope() {
+  primitive_tag = previous_;
+}
+
 void CudaAllocator::trace_device_memory(
     const char* where,
     std::atomic<size_t>& seen,
@@ -400,7 +417,13 @@ void CudaAllocator::trace_device_memory(
     return;
   }
   size_t n = seen.fetch_add(1, std::memory_order_relaxed);
-  if (n >= 32 && n % 256 != 0) {
+  // Sampling one in 256 keeps the log readable for the small allocations that
+  // dominate by count, but it also makes counts of the *large* ones
+  // meaningless — and those are the only ones that decide whether a run fits.
+  // Reading a sampled tally as a true tally cost real diagnostic time here, so
+  // anything big enough to matter on its own is always printed.
+  constexpr size_t always_trace_bytes = size_t{256} << 20;
+  if (n >= 32 && n % 256 != 0 && size < always_trace_bytes) {
     return;
   }
   int device = -1;
@@ -424,9 +447,11 @@ void CudaAllocator::trace_device_memory(
   size_t foreign = held > reserved ? held - reserved : 0;
   fmt::print(
       stderr,
-      "[mlx][cuda-mem] {} n={} size={} free={} total={} pool_reserved={} "
-      "pool_used={} foreign={} reserve={} active={} cache={} limit={}\n",
+      "[mlx][cuda-mem] {} prim={} n={} size={} free={} total={} "
+      "pool_reserved={} pool_used={} foreign={} reserve={} active={} "
+      "cache={} limit={}\n",
       where,
+      primitive_tag ? primitive_tag : "-",
       n,
       size,
       free,

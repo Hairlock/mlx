@@ -66,6 +66,9 @@ void eval(array& arr) {
     if (arr.is_tracer()) {
       inputs = arr.inputs();
     }
+    // Name the primitive for the allocator's trace: an allocation large
+    // enough to decide whether a run fits should say which op asked for it.
+    cu::PrimitiveTagScope tag(arr.primitive().name());
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
 
