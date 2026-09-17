@@ -1,6 +1,11 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <numeric>
+#include <set>
+#include <sstream>
 
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
@@ -710,6 +715,48 @@ bool RoPE::is_equivalent(const Primitive& other) const {
       forward_ == a_other.forward_);
 }
 
+namespace {
+
+// The fused SDPA dispatch silently degrades: when no fused kernel matches, the
+// frontend falls back to an explicit matmul/softmax composition whose score
+// tensor is O(B * n_q_heads * L_q * L_kv) and, because `softmax(..., precise)`
+// upcasts, materializes in float32. At L = 5376 with 32 heads that is 3.45 GiB
+// per call, which is the difference between fitting on a 48 GB card and not.
+// `has_fused_kernel` already computes the reason it refused; MLX throws the
+// string away. Emit it once per distinct dispatch shape so a run can be told
+// "the fused path was taken" from "the fused path was refused, here is which
+// predicate said no", without flooding the log at one line per layer per step.
+void trace_sdpa_dispatch(
+    const array& q,
+    const array& k,
+    bool has_arr_mask,
+    bool do_causal,
+    bool is_training,
+    bool has_fast_vjp,
+    bool took_fallback,
+    const char* where) {
+  static const bool enabled = std::getenv("MLX_SDPA_TRACE") != nullptr;
+  if (!enabled) {
+    return;
+  }
+  std::ostringstream msg;
+  msg << "[mlx][sdpa] " << where << " q=" << q.shape() << " k=" << k.shape()
+      << " dtype=" << q.dtype() << " arr_mask=" << has_arr_mask
+      << " causal=" << do_causal << " training=" << is_training
+      << " fast_vjp=" << has_fast_vjp << " fallback=" << took_fallback;
+  auto line = msg.str();
+
+  static std::mutex mtx;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (seen.insert(line).second) {
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+  }
+}
+
+} // namespace
+
 /** Computes: O = softmax(Q @ K.T) @ V **/
 array scaled_dot_product_attention(
     const array& queries,
@@ -926,18 +973,46 @@ array scaled_dot_product_attention(
 
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
-  bool output_logsumexp = is_training && has_fast_vjp;
-  if (!ScaledDotProductAttention::use_fallback(
-          q,
-          k,
-          v,
-          has_mask,
-          has_arr_mask,
-          do_causal,
-          is_training,
-          output_logsumexp,
-          force_fused,
-          stream)) {
+  // The logsumexp output is what lets `vjp` reach the fused backward kernel;
+  // without it the gradient falls through to `Custom::vjp`, which
+  // differentiates the composed fallback and materializes an
+  // O(B * n_q_heads * L_q * L_kv) score tensor. Gating it on
+  // `in_grad_tracing()` makes it a forward-time *guess* about whether a
+  // gradient will later be demanded, and that guess is wrong by construction
+  // under gradient checkpointing: the forward that actually gets
+  // differentiated is a recomputation whose tracing state need not match the
+  // one that built this primitive. Guessing wrong is not a small penalty —
+  // at L = 5376 with 32 heads it is 3.45 GiB of transient per call.
+  //
+  // For any multi-token query the logsumexp array is B * H * L_q * 4 bytes,
+  // four orders of magnitude smaller than the tensor it avoids, so emit it
+  // whenever a fused backward exists rather than trying to predict the need.
+  // Short queries are the one case that stays gated: they never take a
+  // gradient, and `supports_sdpa_vector` refuses the logsumexp output
+  // outright, so emitting it there would push decoding off the vector kernel
+  // for nothing. The bound mirrors that kernel's own domain (q_len < 4).
+  bool output_logsumexp = has_fast_vjp && (is_training || q.shape(2) >= 4);
+  bool forward_fallback = ScaledDotProductAttention::use_fallback(
+      q,
+      k,
+      v,
+      has_mask,
+      has_arr_mask,
+      do_causal,
+      is_training,
+      output_logsumexp,
+      force_fused,
+      stream);
+  trace_sdpa_dispatch(
+      q,
+      k,
+      has_arr_mask,
+      do_causal,
+      is_training,
+      has_fast_vjp,
+      forward_fallback,
+      "forward");
+  if (!forward_fallback) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
@@ -980,6 +1055,18 @@ std::vector<array> ScaledDotProductAttention::vjp(
 
   auto s = stream();
   if (ScaledDotProductAttentionVJP::use_fallback(primals[0], s)) {
+    // Differentiating `fallback_` rebuilds the full score tensor. Name this
+    // path explicitly: a fused forward paired with this backward looks fine in
+    // any forward-only profile and still OOMs under training.
+    trace_sdpa_dispatch(
+        primals[0],
+        primals[1],
+        primals.size() > 3,
+        do_causal_,
+        /* is_training = */ true,
+        /* has_fast_vjp = */ false,
+        /* took_fallback = */ true,
+        "backward");
     assert(outputs.size() == 1);
     return Custom::vjp(primals, cotangents, argnums, outputs);
   }
