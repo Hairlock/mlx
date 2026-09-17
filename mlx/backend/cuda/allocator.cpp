@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <string>
@@ -144,9 +145,13 @@ CudaAllocator::CudaAllocator()
           page_size,
           [](CudaBuffer* buf) { return buf->size; },
           [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
-  size_t free;
+  size_t free = 0;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
-  memory_limit_ = total_memory_ * 0.95;
+  // Memory the device has already handed to someone else -- the CUDA context
+  // above all -- is never ours to allocate, so a limit derived from the total
+  // alone is a limit that can never be reached. Clamp to what is actually
+  // free, and let the difference widen the reserve `free_limit_` protects.
+  memory_limit_ = std::min(static_cast<size_t>(total_memory_ * 0.95), free);
   free_limit_ = total_memory_ - memory_limit_;
   max_pool_size_ = memory_limit_;
 
@@ -191,8 +196,13 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   // wait; they are issued by the thread walking the eval tape, which never
   // runs inside a task the wait could depend on. Nothing here commits the
   // open graph — the caller is mid-way through encoding it.
+  // Cached buffers count against the limit because they are memory MLX holds
+  // and the device cannot hand to anyone else: a freed buffer goes back to the
+  // CUDA async pool, not to the device. Waiting on `active_memory_` alone lets
+  // the real footprint reach the limit twice over, which is how a run whose
+  // limit was 37.75 GB peaked at 43.09 GB with 15.28 GB sitting in cache.
   if (!buf && device >= 0) {
-    while (active_memory_ + size > memory_limit_ &&
+    while (active_memory_ + get_cache_memory() + size > memory_limit_ &&
            scheduler::n_active_tasks() > 0) {
       lock.unlock();
       scheduler::wait_for_completion();
@@ -241,17 +251,22 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
 
     // If any cuda memory pool has too much reserved memory, clear some
     // memory from the cache. This prevents graph / kernel execution failing
-    // from OOM
-    if (get_cache_memory() > 0) {
-      for (auto p : mem_pools_) {
-        if (p) {
-          size_t used = 0;
-          CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
-              p, cudaMemPoolAttrReservedMemCurrent, &used));
-          if (used > (total_memory_ - free_limit_)) {
-            buffer_cache_.release_cached_buffers(free_limit_);
-            break;
-          }
+    // from OOM.
+    //
+    // Releasing cached buffers alone cannot do that: a released buffer is
+    // handed back to the async pool, which keeps its pages reserved, so the
+    // reserved figure this very condition tests is unchanged by the release.
+    // Trimming is the step that turns the freed reservation back into device
+    // memory a graph instantiation or a kernel's launch resources can use.
+    for (auto p : mem_pools_) {
+      if (p) {
+        size_t reserved = 0;
+        CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
+            p, cudaMemPoolAttrReservedMemCurrent, &reserved));
+        if (reserved > (total_memory_ - free_limit_)) {
+          buffer_cache_.release_cached_buffers(free_limit_);
+          trim_pools();
+          break;
         }
       }
     }
@@ -269,6 +284,14 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     move_to_unified_memory(*buf, stream);
   }
   return Buffer{buf};
+}
+
+void CudaAllocator::trim_pools() {
+  for (auto p : mem_pools_) {
+    if (p) {
+      CHECK_CUDA_ERROR(cudaMemPoolTrimTo(p, 0));
+    }
+  }
 }
 
 // The memory limit bounds what this allocator counts, not what the device
@@ -296,8 +319,16 @@ void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
     {
       std::lock_guard lock(mutex_);
       buffer_cache_.release_cached_buffers(get_cache_memory());
+      trim_pools();
     }
     scheduler::wait_for_completion();
+  }
+  // Nothing is left in flight to wait for, so this is the last chance to make
+  // the reservation usable before the allocation is attempted anyway.
+  if (available() < size) {
+    std::lock_guard lock(mutex_);
+    buffer_cache_.release_cached_buffers(get_cache_memory());
+    trim_pools();
   }
 }
 

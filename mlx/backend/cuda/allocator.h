@@ -72,6 +72,14 @@ class CudaAllocator : public allocator::Allocator {
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
   // Called without mutex_ held, with |device| current.
   void wait_for_physical_memory(size_t size, int device);
+  // Return every memory pool's unused reservation to the device. Freeing a
+  // buffer hands it back to the CUDA async pool, which keeps the pages
+  // reserved for its own future allocations; anything that allocates outside
+  // the pool -- a graph instantiation, a cuDNN workspace, a kernel's launch
+  // resources -- cannot touch that reservation and fails with an out-of-memory
+  // the pool's own statistics contradict. Trimming is what turns a released
+  // buffer back into device memory those consumers can actually use.
+  void trim_pools();
 
   CudaAllocator();
   friend CudaAllocator& allocator();
