@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/utils.h"
+#include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/dtype_utils.h"
 
@@ -10,8 +11,31 @@
 
 namespace mlx::core {
 
+// An out-of-memory from anywhere -- a pool allocation, a graph instantiation,
+// a kernel launch reserving its resources -- is the device telling us the
+// allocator is holding back too little for the consumers that cannot use its
+// pool. Feed it back before the throw so whatever retries runs under a reserve
+// that accounts for it. The guard is for the error paths the allocator itself
+// sits on: its constructor and its own CUDA calls run through this function,
+// and re-entering the allocator from there would recurse or deadlock.
+static void report_out_of_memory_once() {
+  static thread_local bool reporting = false;
+  if (reporting || !cu::allocator_live().load(std::memory_order_acquire)) {
+    return;
+  }
+  reporting = true;
+  try {
+    cu::allocator().report_out_of_memory();
+  } catch (...) {
+  }
+  reporting = false;
+}
+
 void check_cuda_error(const char* name, cudaError_t err) {
   if (err != cudaSuccess) {
+    if (err == cudaErrorMemoryAllocation) {
+      report_out_of_memory_once();
+    }
     throw std::runtime_error(
         fmt::format("{} failed: {}", name, cudaGetErrorString(err)));
   }
@@ -19,6 +43,9 @@ void check_cuda_error(const char* name, cudaError_t err) {
 
 void check_cuda_error(const char* name, CUresult err) {
   if (err != CUDA_SUCCESS) {
+    if (err == CUDA_ERROR_OUT_OF_MEMORY) {
+      report_out_of_memory_once();
+    }
     const char* err_str = "Unknown error";
     cuGetErrorString(err, &err_str);
     throw std::runtime_error(fmt::format("{} failed: {}", name, err_str));

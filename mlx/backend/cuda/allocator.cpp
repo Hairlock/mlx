@@ -152,9 +152,10 @@ CudaAllocator::CudaAllocator()
   // alone is a limit that can never be reached. Clamp to what is actually
   // free, and let the difference widen the reserve `free_limit_` protects.
   // Nothing is ours yet, so everything the device has already handed out is
-  // the first measurement of what never will be. Seeding the high-water mark
-  // here is what stops a caller's `set_memory_limit` from claiming it back.
-  foreign_peak_ = total_memory_ - free;
+  // the first measurement of the consumers that never allocate from this
+  // pool. Seeding the reserve with it is what keeps `set_memory_limit` and
+  // every later allocation from spending memory that was never ours.
+  foreign_reserve_.store(total_memory_ - free, std::memory_order_relaxed);
   memory_limit_ = std::min(static_cast<size_t>(total_memory_ * 0.95), free);
   free_limit_ = total_memory_ - memory_limit_;
   max_pool_size_ = memory_limit_;
@@ -298,19 +299,39 @@ void CudaAllocator::trim_pools() {
   }
 }
 
-// The memory limit is a claim about how much of the device is ours, and a
-// fixed fraction of the device total is a guess at that claim rather than a
-// measurement of it. What the claim has to exclude is everything holding
-// device memory outside this pool: the CUDA context, NVRTC modules, cuDNN
-// workspaces, instantiated graph executables. That figure measured about
-// 4.8 GB on an L40S, against the 2.4 GB a 0.95 fraction leaves, which is how
-// a run peaks under its own limit and over what the card has left. It is also
-// a different number on the next card and grows as a run instantiates more
-// graphs, so no constant is right either. Measure it on every sample, keep
-// the high-water mark, and let the limit follow it down -- never back up,
-// since rising again would hand back headroom the measurement just proved
-// another consumer needs.
-size_t CudaAllocator::observe_device_memory(int device) {
+void CudaAllocator::raise_reserve(size_t reserve) {
+  size_t current = foreign_reserve_.load(std::memory_order_relaxed);
+  while (reserve > current &&
+         !foreign_reserve_.compare_exchange_weak(
+             current, reserve, std::memory_order_relaxed)) {
+  }
+}
+
+// The device refusing an allocation is the one measurement sampling can never
+// make: a sample sees the allocations outside this pool that succeeded, never
+// the one that failed. So treat the refusal as the measurement it is and grow
+// the reserve, so whatever retries finds the room this attempt did not. The
+// step is a fraction of the reserve rather than a constant because the right
+// figure is a property of the card and the graphs a run instantiates, and a
+// few refusals converge on it from a measured starting point instead of
+// guessing it up front.
+void CudaAllocator::report_out_of_memory() {
+  size_t current = foreign_reserve_.load(std::memory_order_relaxed);
+  raise_reserve(current + current / 4 + page_size);
+}
+
+// Report what the device can still hand out, keeping the two kinds of room
+// apart: the pool's unused reservation is already off the device's free list,
+// so spending it costs no free memory and only `cudaMallocAsync` can do it,
+// while anything else has to come out of free memory that every consumer
+// competes for. Sampling doubles as a measurement of the reserve -- whatever
+// the device holds beyond this allocator's reservation belongs to consumers
+// the pool cannot serve, so a sample showing more of it than the reserve holds
+// back proves the reserve too small. Resident managed memory and the scalar
+// pool land on that side of the subtraction too; both are small, and counting
+// them here only makes the reserve larger than it strictly has to be, which is
+// the direction that is safe to be wrong in.
+CudaAllocator::Availability CudaAllocator::observe_device_memory(int device) {
   auto pool = mem_pools_[device];
   size_t free = 0;
   size_t total = 0;
@@ -322,37 +343,29 @@ size_t CudaAllocator::observe_device_memory(int device) {
   CHECK_CUDA_ERROR(
       cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
 
-  // Resident managed memory and the scalar pool land on the foreign side of
-  // this subtraction because they do not come from the async pool. Both are
-  // small, and counting them as someone else's only makes the limit lower
-  // than it strictly has to be, which is the direction that is safe to be
-  // wrong in.
   size_t held = total - free;
-  size_t foreign = held > reserved ? held - reserved : 0;
-  if (foreign > foreign_peak_) {
-    std::lock_guard lock(mutex_);
-    foreign_peak_ = foreign;
-    size_t bound =
-        total_memory_ > foreign_peak_ ? total_memory_ - foreign_peak_ : 0;
-    if (bound < memory_limit_) {
-      memory_limit_ = bound;
-      free_limit_ = total_memory_ - memory_limit_;
-      max_pool_size_ = std::min(max_pool_size_, memory_limit_);
-    }
-  }
-  return free + (reserved - used);
+  raise_reserve(held > reserved ? held - reserved : 0);
+  return Availability{free, reserved - used};
 }
 
 // The memory limit bounds what this allocator counts, not what the device
 // holds: the CUDA context, instantiated graph executables and pool
-// fragmentation all sit on top of it. When neither the pool's reserved
-// memory nor the device's free memory can serve |size|, allocating anyway
-// leaves the next graph launch to fail with a sticky out-of-memory error.
-// Hand cached buffers back to the pool and wait for in-flight work instead,
-// for as long as there is work to wait for.
+// fragmentation all sit on top of it. An allocation is safe only once the
+// device can serve it without eating into the reserve -- either out of the
+// pool's own reservation, which costs no free memory, or out of free memory
+// with the reserve still left behind. Counting the reservation as available
+// for any allocation, as an earlier version of this did, is what lets a run
+// fill the card to the last byte of its pool and then die on the next graph
+// launch with an out-of-memory the pool's own statistics contradict. Hand
+// cached buffers back to the device and wait for in-flight work instead, for
+// as long as there is work to wait for.
 void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
-  auto available = [this, device]() { return observe_device_memory(device); };
-  while (available() < size && scheduler::n_active_tasks() > 0) {
+  auto servable = [this, device, size]() {
+    auto avail = observe_device_memory(device);
+    return avail.pooled >= size ||
+        avail.free >= size + foreign_reserve_.load(std::memory_order_relaxed);
+  };
+  while (!servable() && scheduler::n_active_tasks() > 0) {
     {
       std::lock_guard lock(mutex_);
       buffer_cache_.release_cached_buffers(get_cache_memory());
@@ -362,7 +375,7 @@ void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
   }
   // Nothing is left in flight to wait for, so this is the last chance to make
   // the reservation usable before the allocation is attempted anyway.
-  if (available() < size) {
+  if (!servable()) {
     std::lock_guard lock(mutex_);
     buffer_cache_.release_cached_buffers(get_cache_memory());
     trim_pools();
@@ -466,13 +479,13 @@ size_t CudaAllocator::get_memory_limit() {
 // A caller asking for a limit is expressing a budget, not a fact about the
 // device. Honour it only down to what the device has actually left us: a
 // framework that computes its ceiling from the device total would otherwise
-// undo the constructor's clamp and every tightening `observe_device_memory`
-// has made, and get back the out-of-memory those measurements exist to
-// prevent. Returns the limit that was in force.
+// undo the constructor's clamp and spend the reserve, and get back the
+// out-of-memory the reserve exists to prevent. Returns the limit that was in
+// force.
 size_t CudaAllocator::set_memory_limit(size_t limit) {
   std::lock_guard lock(mutex_);
-  size_t bound =
-      total_memory_ > foreign_peak_ ? total_memory_ - foreign_peak_ : 0;
+  size_t reserve = foreign_reserve_.load(std::memory_order_relaxed);
+  size_t bound = total_memory_ > reserve ? total_memory_ - reserve : 0;
   limit = std::min(limit, bound);
   std::swap(limit, memory_limit_);
   free_limit_ = total_memory_ - memory_limit_;
@@ -494,6 +507,16 @@ void CudaAllocator::clear_cache() {
   buffer_cache_.clear();
 }
 
+// The singleton below is built by a function-local static, and its constructor
+// makes CUDA calls that run through `check_cuda_error`. Reaching back into
+// `allocator()` from that error path would re-enter an initialization already
+// in progress, so the error path asks this first and stays out until the
+// singleton exists.
+std::atomic<bool>& allocator_live() {
+  static std::atomic<bool> live{false};
+  return live;
+}
+
 CudaAllocator& allocator() {
   static auto* allocator_ = []() {
     // Ensure scheduler is created before allocator.
@@ -501,7 +524,9 @@ CudaAllocator& allocator() {
     // By creating the |allocator_| on heap, the destructor of CudaAllocator
     // will not be called on exit and buffers in the cache will be leaked. This
     // can save some time at program exit.
-    return new CudaAllocator();
+    auto* a = new CudaAllocator();
+    allocator_live().store(true, std::memory_order_release);
+    return a;
   }();
   return *allocator_;
 }

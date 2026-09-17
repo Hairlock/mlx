@@ -7,6 +7,7 @@
 #include "mlx/backend/cuda/cuda_utils.h"
 
 #include <cuda_runtime.h>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -66,16 +67,31 @@ class CudaAllocator : public allocator::Allocator {
   size_t get_cache_memory() const;
   size_t set_cache_limit(size_t limit);
   void clear_cache();
+  // Record that the device refused an allocation. Grows the reserve this
+  // allocator holds back for consumers that cannot draw on its pool, so a
+  // retry finds the room this attempt did not. Never throws, never takes
+  // mutex_: it runs on the error path, where the caller may hold it.
+  void report_out_of_memory();
 
  private:
   void free_cuda_buffer(CudaBuffer* buf);
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
   // Called without mutex_ held, with |device| current.
   void wait_for_physical_memory(size_t size, int device);
-  // Sample what the device has actually handed out, tighten `memory_limit_`
-  // to exclude the part of it that is not ours, and return what |device|'s
-  // pool can still serve. Called without mutex_ held.
-  size_t observe_device_memory(int device);
+  // What the device can still hand out, split by who is able to take it.
+  // |pooled| is this allocator's own unused reservation, which only
+  // `cudaMallocAsync` on |device| can draw on; |free| is device memory nobody
+  // holds, which every consumer can. Sampling also raises `foreign_reserve_`
+  // when the sample shows more memory held outside the pool than the reserve
+  // currently accounts for. Called without mutex_ held.
+  struct Availability {
+    size_t free;
+    size_t pooled;
+  };
+  Availability observe_device_memory(int device);
+  // Raise `foreign_reserve_` to |reserve| if it is larger. Lock-free: the
+  // reserve only ever grows, so a lost race is a sample another will retake.
+  void raise_reserve(size_t reserve);
   // Return every memory pool's unused reservation to the device. Freeing a
   // buffer hands it back to the CUDA async pool, which keeps the pages
   // reserved for its own future allocations; anything that allocates outside
@@ -96,16 +112,25 @@ class CudaAllocator : public allocator::Allocator {
   BufferCache<CudaBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
-  // High-water mark of device memory held by everything that is not this
-  // allocator's pool. Only ever grows, and `memory_limit_` only ever falls
-  // to stay under it.
-  size_t foreign_peak_{0};
+  // Device memory that must stay free after any allocation this allocator
+  // makes, because the consumers that need it cannot allocate from the pool:
+  // the CUDA context, NVRTC modules, cuDNN workspaces, instantiated graph
+  // executables. Seeded from what the device had already handed out before
+  // MLX allocated anything, raised by samples that see more held outside the
+  // pool, and raised again whenever the device refuses an allocation. It only
+  // ever grows -- giving headroom back would hand away memory a measurement
+  // just proved another consumer needs.
+  std::atomic<size_t> foreign_reserve_{0};
   std::vector<CudaStream> free_streams_;
   std::vector<cudaMemPool_t> mem_pools_;
   SmallSizePool scalar_pool_;
 };
 
 CudaAllocator& allocator();
+
+// Whether `allocator()`'s singleton has finished constructing. Consulted by
+// the CUDA error path, which the constructor's own CUDA calls run through.
+std::atomic<bool>& allocator_live();
 
 Buffer malloc_async(size_t size, CommandEncoder& encoder);
 
