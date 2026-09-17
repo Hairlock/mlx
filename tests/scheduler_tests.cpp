@@ -237,6 +237,30 @@ TEST_CASE("test stream placement") {
   }
 }
 
+TEST_CASE("test wait for completion drains to zero") {
+  auto s = default_stream(default_device());
+  auto& sched = scheduler::scheduler();
+  int base = sched.n_active_tasks();
+
+  // Nothing in flight: returns immediately.
+  sched.wait_for_completion();
+  CHECK_EQ(sched.n_active_tasks(), base);
+
+  // A single task in flight: wait_for_one would return at once, but
+  // wait_for_completion must block until that task completes.
+  sched.notify_new_task(s);
+  std::atomic<bool> completed{false};
+  std::thread t([&]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    completed = true;
+    sched.notify_task_completion(s);
+  });
+  sched.wait_for_completion();
+  CHECK(completed.load());
+  CHECK_EQ(sched.n_active_tasks(), base);
+  t.join();
+}
+
 TEST_CASE("test scheduler races") {
   auto x = zeros({1});
   auto y = zeros({100});

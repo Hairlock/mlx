@@ -460,10 +460,15 @@ bool CommandEncoder::needs_commit() {
       ((bytes_in_graph_ >> 20) > max_mb_per_graph_);
 }
 
-void CommandEncoder::commit() {
+bool CommandEncoder::has_pending_work() const {
+  return node_count_ > 0 || !temporaries_.empty() ||
+      worker_->has_pending_tasks();
+}
+
+void CommandEncoder::commit(std::function<void()> completion) {
   nvtx3::scoped_range r("CommandEncoder::commit");
   try {
-    commit_impl();
+    commit_impl(std::move(completion));
   } catch (...) {
     // Clear pending CUDA error first.
     cudaGetLastError();
@@ -497,9 +502,14 @@ void CommandEncoder::synchronize() {
   f.wait();
 }
 
-void CommandEncoder::commit_impl() {
+void CommandEncoder::commit_impl(std::function<void()> completion) {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
+  }
+  // Handlers run in insertion order, so the completion observes the
+  // temporaries already released.
+  if (completion) {
+    add_completed_handler(std::move(completion));
   }
   if (use_cuda_graphs() && node_count_ > 0) {
     if (!from_nodes_.empty()) {

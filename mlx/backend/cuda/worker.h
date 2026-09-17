@@ -28,6 +28,10 @@ class Worker : public std::enable_shared_from_this<Worker> {
   // Add a pending |task| that will run when consumed or commited.
   void add_task(std::function<void()> task);
 
+  bool has_pending_tasks() const {
+    return !pending_tasks_.empty();
+  }
+
   // Inform worker thread to run current batches after kernels in |stream|
   // finish running.
   void commit(cudaStream_t stream);

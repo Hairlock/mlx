@@ -53,10 +53,26 @@ class MLX_API Scheduler {
     return n_active_tasks_;
   }
 
+  // Wait for a task to finish while keeping at least one in flight, so the
+  // device pipeline is never drained just to bound queue depth.
   void wait_for_one() {
     std::unique_lock<std::mutex> lk(mtx);
     int n_tasks_old = n_active_tasks();
     if (n_tasks_old > 1) {
+      completion_cv.wait(lk, [this, n_tasks_old] {
+        return this->n_active_tasks() < n_tasks_old;
+      });
+    }
+  }
+
+  // Wait for any in-flight task to finish, down to zero. This is the wait
+  // for memory backpressure: the point is to reclaim the memory a finished
+  // task releases, and the last task in flight holds memory just like the
+  // others. Returns immediately when nothing is in flight.
+  void wait_for_completion() {
+    std::unique_lock<std::mutex> lk(mtx);
+    int n_tasks_old = n_active_tasks();
+    if (n_tasks_old > 0) {
       completion_cv.wait(lk, [this, n_tasks_old] {
         return this->n_active_tasks() < n_tasks_old;
       });
@@ -112,6 +128,10 @@ inline void notify_task_completion(const Stream& stream) {
 
 inline void wait_for_one() {
   scheduler().wait_for_one();
+}
+
+inline void wait_for_completion() {
+  scheduler().wait_for_completion();
 }
 
 } // namespace mlx::core::scheduler

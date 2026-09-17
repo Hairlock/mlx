@@ -70,6 +70,8 @@ class CudaAllocator : public allocator::Allocator {
  private:
   void free_cuda_buffer(CudaBuffer* buf);
   void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
+  // Called without mutex_ held, with |device| current.
+  void wait_for_physical_memory(size_t size, int device);
 
   CudaAllocator();
   friend CudaAllocator& allocator();

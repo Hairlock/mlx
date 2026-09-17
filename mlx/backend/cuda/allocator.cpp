@@ -183,6 +183,27 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   // Find available buffer from cache.
   std::unique_lock lock(mutex_);
   CudaBuffer* buf = buffer_cache_.reuse_from_cache(size);
+
+  // Backpressure for device allocations: while work is in flight, its
+  // completion returns memory to the cache, so waiting for it is strictly
+  // better than allocating past the limit and racing the device for the
+  // physical headroom the limit exists to protect. Only device allocations
+  // wait; they are issued by the thread walking the eval tape, which never
+  // runs inside a task the wait could depend on. Nothing here commits the
+  // open graph — the caller is mid-way through encoding it.
+  if (!buf && device >= 0) {
+    while (active_memory_ + size > memory_limit_ &&
+           scheduler::n_active_tasks() > 0) {
+      lock.unlock();
+      scheduler::wait_for_completion();
+      lock.lock();
+      buf = buffer_cache_.reuse_from_cache(size);
+      if (buf) {
+        break;
+      }
+    }
+  }
+
   if (!buf) {
     // If we have a lot of memory pressure try to reclaim memory from the cache.
     int64_t mem_to_free =
@@ -203,6 +224,7 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
       } else {
         cu::device(device).make_current();
         if (mem_pools_[device]) { // supports memory pools
+          wait_for_physical_memory(size, device);
           CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
         } else {
           CHECK_CUDA_ERROR(cudaMalloc(&data, size));
@@ -247,6 +269,36 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     move_to_unified_memory(*buf, stream);
   }
   return Buffer{buf};
+}
+
+// The memory limit bounds what this allocator counts, not what the device
+// holds: the CUDA context, instantiated graph executables and pool
+// fragmentation all sit on top of it. When neither the pool's reserved
+// memory nor the device's free memory can serve |size|, allocating anyway
+// leaves the next graph launch to fail with a sticky out-of-memory error.
+// Hand cached buffers back to the pool and wait for in-flight work instead,
+// for as long as there is work to wait for.
+void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
+  auto pool = mem_pools_[device];
+  auto available = [pool]() {
+    size_t free = 0;
+    size_t total = 0;
+    CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total));
+    size_t reserved = 0;
+    size_t used = 0;
+    CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
+        pool, cudaMemPoolAttrReservedMemCurrent, &reserved));
+    CHECK_CUDA_ERROR(
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
+    return free + (reserved - used);
+  };
+  while (available() < size && scheduler::n_active_tasks() > 0) {
+    {
+      std::lock_guard lock(mutex_);
+      buffer_cache_.release_cached_buffers(get_cache_memory());
+    }
+    scheduler::wait_for_completion();
+  }
 }
 
 Buffer CudaAllocator::malloc(size_t size) {

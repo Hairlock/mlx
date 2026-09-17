@@ -111,7 +111,13 @@ class CommandEncoder {
 
   void add_completed_handler(std::function<void()> task);
   bool needs_commit();
-  void commit();
+  // True when a commit would launch kernels, release temporaries, or run
+  // completion handlers; false means commit is a no-op.
+  bool has_pending_work() const;
+  // Launch the pending graph. |completion| runs on the worker thread after
+  // every handler queued before it, including the one that releases the
+  // temporaries held for this graph.
+  void commit(std::function<void()> completion = nullptr);
 
   Device& device() {
     return device_;
@@ -138,7 +144,7 @@ class CommandEncoder {
     std::string id;
   };
 
-  void commit_impl();
+  void commit_impl(std::function<void()> completion);
   void clear_graph_state();
   void insert_graph_dependencies(GraphNode node);
   void insert_graph_dependencies(std::vector<GraphNode> nodes);

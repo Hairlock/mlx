@@ -38,6 +38,20 @@ void new_thread_unsafe_stream(Stream s) {
   encoders.try_emplace(s.index, d);
 }
 
+// Every commit is a scheduler task, whether it comes from the op limit in
+// eval or from finalize: the memory throttle in eval_impl waits on the
+// scheduler's task count, so a graph committed without a task would hold
+// its temporaries invisibly and the throttle could not wait for them. The
+// encoder runs the completion after it has released the temporaries, so
+// waking the throttle means the memory is actually back.
+static void commit(cu::CommandEncoder& encoder, const Stream& stream) {
+  if (!encoder.has_pending_work()) {
+    return;
+  }
+  scheduler::notify_new_task(stream);
+  encoder.commit([stream]() { scheduler::notify_task_completion(stream); });
+}
+
 void eval(array& arr) {
   nvtx3::scoped_range r("gpu::eval");
   // Ensure CUDA context is active on this thread. Required when MLX is called
@@ -69,16 +83,13 @@ void eval(array& arr) {
   }
 
   if (encoder.needs_commit()) {
-    scheduler::notify_new_task(stream);
-    encoder.add_completed_handler(
-        [stream]() { scheduler::notify_task_completion(stream); });
-    encoder.commit();
+    commit(encoder, stream);
   }
 }
 
 void finalize(Stream s) {
   nvtx3::scoped_range r("gpu::finalize");
-  cu::get_command_encoder(s).commit();
+  commit(cu::get_command_encoder(s), s);
 }
 
 void synchronize(Stream s) {

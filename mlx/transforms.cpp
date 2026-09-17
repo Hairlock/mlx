@@ -225,6 +225,35 @@ array eval_impl(std::vector<array> outputs, bool async) {
   }
 
   std::set<Stream> open_streams;
+  auto commit_open_streams = [&open_streams]() {
+    for (auto& s : open_streams) {
+      if (s.device == Device::gpu) {
+        gpu::finalize(s);
+      }
+    }
+  };
+  // The throttle after gpu::eval only runs once an op's outputs are already
+  // allocated and reacts once per op, so on its own it lets the host run
+  // ahead of the device and overshoot the memory limit by the outputs of
+  // everything still queued. Reclaim memory from in-flight work before
+  // allocating whenever the outputs would push active memory past the limit.
+  // The wait ends as soon as nothing is in flight, so a working set that
+  // genuinely exceeds the limit still proceeds.
+  auto reclaim_before_alloc = [&commit_open_streams](const array& arr) {
+    size_t upcoming = arr.nbytes();
+    for (auto& s : arr.siblings()) {
+      upcoming += s.nbytes();
+    }
+    auto limit = get_memory_limit();
+    if (get_active_memory() + upcoming <= limit) {
+      return;
+    }
+    commit_open_streams();
+    while (get_active_memory() + upcoming > limit &&
+           scheduler::n_active_tasks() > 0) {
+      scheduler::wait_for_completion();
+    }
+  };
   try {
     while (!tape.empty()) {
       auto arr = std::move(tape.back());
@@ -263,6 +292,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
       }
 
       if (arr.primitive().device() == Device::gpu) {
+        reclaim_before_alloc(arr);
         gpu::eval(arr);
       } else {
         cpu::eval(arr);
@@ -271,16 +301,14 @@ array eval_impl(std::vector<array> outputs, bool async) {
       if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
           (get_active_memory() > get_memory_limit() &&
            scheduler::n_active_tasks() > 0)) {
-        // Commit any open streams
-        for (auto& s : open_streams) {
-          if (s.device == Device::gpu) {
-            gpu::finalize(s);
-          }
-        }
+        commit_open_streams();
         scheduler::wait_for_one();
+        // wait_for_one returns immediately with a single task in flight,
+        // which turned this loop into a busy spin; the memory it holds is
+        // exactly what we are waiting for.
         while (get_active_memory() > get_memory_limit() &&
                scheduler::n_active_tasks() > 0) {
-          scheduler::wait_for_one();
+          scheduler::wait_for_completion();
         }
       }
 
