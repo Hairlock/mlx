@@ -302,6 +302,17 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   if (get_cache_memory() > max_pool_size_) {
     buffer_cache_.release_cached_buffers(get_cache_memory() - max_pool_size_);
   }
+
+  // The allocation succeeded, so the pool demonstrably services this footprint.
+  // Recorded against the same sum the limit budgets -- cached bytes are held by
+  // this allocator and unavailable to the device just as active ones are -- so
+  // that a ceiling learned from it can be compared with the limit directly.
+  size_t serviced = active_memory_ + get_cache_memory();
+  size_t peak = serviced_peak_.load(std::memory_order_relaxed);
+  while (serviced > peak &&
+         !serviced_peak_.compare_exchange_weak(
+             peak, serviced, std::memory_order_relaxed)) {
+  }
   lock.unlock();
   // Copy to unified memory here if the buffer is not on the right device.
   if (buf->device >= 0 && buf->device != device) {
@@ -403,7 +414,8 @@ void CudaAllocator::trace_device_memory(
   fmt::print(
       stderr,
       "[mlx][cuda-mem] {} n={} size={} free={} total={} pool_reserved={} "
-      "pool_used={} foreign={} reserve={} active={} cache={} limit={}\n",
+      "pool_used={} foreign={} reserve={} active={} cache={} serviced_peak={} "
+      "ceiling={} limit={}\n",
       where,
       n,
       size,
@@ -415,6 +427,8 @@ void CudaAllocator::trace_device_memory(
       free_limit_.load(std::memory_order_relaxed),
       active_memory_,
       get_cache_memory(),
+      serviced_peak_.load(std::memory_order_relaxed),
+      pool_ceiling_.load(std::memory_order_relaxed),
       memory_limit());
 }
 
@@ -428,6 +442,20 @@ void CudaAllocator::raise_reserve(size_t reserve) {
   while (reserve > current &&
          !free_limit_.compare_exchange_weak(
              current, reserve, std::memory_order_relaxed)) {
+  }
+}
+
+void CudaAllocator::lower_pool_ceiling(size_t ceiling) {
+  // A tenth of the card floors what any single fallthrough may claim. The
+  // first allocations of a run are small, so a fallthrough among them -- a
+  // foreign consumer taking the device while MLX holds almost nothing --
+  // would otherwise pin the limit at a footprint no training step can fit
+  // inside, and nothing ever raises it again.
+  ceiling = std::max(ceiling, total_memory_ / 10);
+  size_t current = pool_ceiling_.load(std::memory_order_relaxed);
+  while (ceiling < current &&
+         !pool_ceiling_.compare_exchange_weak(
+             current, ceiling, std::memory_order_relaxed)) {
   }
 }
 
@@ -522,10 +550,19 @@ void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
   }
   // Nothing is left in flight to wait for, so this is the last chance to make
   // the reservation usable before the allocation is attempted anyway.
+  //
+  // Reaching here is also the one unambiguous measurement of the pool's
+  // capacity: every task drained, all cache handed back, pool trimmed, and the
+  // device still holds less than its reserve. Whatever footprint the pool has
+  // serviced up to now is therefore the most it can service, so the limit is
+  // pinned there. Doing it here rather than on the refusal is deliberate --
+  // the refusal reports a request that already failed, while this is the state
+  // just before one, which is where backpressure still has somewhere to go.
   if (!servable()) {
     std::lock_guard lock(mutex_);
     buffer_cache_.release_cached_buffers(get_cache_memory());
     trim_pools();
+    lower_pool_ceiling(serviced_peak_.load(std::memory_order_relaxed));
     static std::atomic<size_t> seen{0};
     trace_device_memory("fallthrough", seen, size);
   }
@@ -629,6 +666,14 @@ void CudaAllocator::reset_peak_memory() {
 size_t CudaAllocator::memory_limit() const {
   size_t reserve = free_limit_.load(std::memory_order_relaxed);
   size_t bound = total_memory_ > reserve ? total_memory_ - reserve : 0;
+  // The pool's measured ceiling bounds this too, and usually below the card:
+  // `total_memory_ - reserve` is what the device holds, while the pool needs
+  // far more reserved than it serves and cannot be made to give the difference
+  // back. Without this term the limit advertises headroom that exists on the
+  // card but not in the pot -- the shape of the failure it was written for was
+  // a limit of 41.5 GB on a run whose 3.53 GB request died with 32.57 GB
+  // active, because 44.56 GB of reservation was already sunk.
+  bound = std::min(bound, pool_ceiling_.load(std::memory_order_relaxed));
   return std::min(requested_limit_.load(std::memory_order_relaxed), bound);
 }
 
