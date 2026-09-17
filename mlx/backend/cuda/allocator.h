@@ -62,6 +62,10 @@ class CudaAllocator : public allocator::Allocator {
   size_t get_active_memory() const;
   size_t get_peak_memory() const;
   void reset_peak_memory();
+  // The limit actually in force: the requested budget, clamped to what the
+  // device has left after the reserve. Derived rather than stored, because the
+  // reserve it is measured against moves.
+  size_t memory_limit() const;
   size_t get_memory_limit();
   size_t set_memory_limit(size_t limit);
   size_t get_cache_memory() const;
@@ -81,15 +85,15 @@ class CudaAllocator : public allocator::Allocator {
   // What the device can still hand out, split by who is able to take it.
   // |pooled| is this allocator's own unused reservation, which only
   // `cudaMallocAsync` on |device| can draw on; |free| is device memory nobody
-  // holds, which every consumer can. Sampling also raises `foreign_reserve_`
-  // when the sample shows more memory held outside the pool than the reserve
+  // holds, which every consumer can. Sampling also raises `free_limit_` when
+  // the sample shows more memory held outside the pool than the reserve
   // currently accounts for. Called without mutex_ held.
   struct Availability {
     size_t free;
     size_t pooled;
   };
   Availability observe_device_memory(int device);
-  // Raise `foreign_reserve_` to |reserve| if it is larger, bounded by half the
+  // Raise `free_limit_` to |reserve| if it is larger, bounded by half the
   // card. Lock-free: the reserve only ever grows, so a lost race is a sample
   // another will retake.
   void raise_reserve(size_t reserve);
@@ -115,22 +119,27 @@ class CudaAllocator : public allocator::Allocator {
   friend CudaAllocator& allocator();
 
   std::mutex mutex_;
-  size_t memory_limit_;
-  size_t free_limit_;
-  size_t total_memory_;
-  size_t max_pool_size_;
+  // Device memory that must stay genuinely free -- not merely unused inside
+  // the async pool's reservation -- because the consumers that need it cannot
+  // allocate from the pool: the CUDA context, NVRTC modules, cuDNN workspaces,
+  // instantiated graph executables. It is the cap on how much the pool may keep
+  // reserved, which makes it the only figure in this allocator that decides how
+  // much of the card those consumers can reach. Seeded from what the device had
+  // already handed out before MLX allocated anything, raised by samples that
+  // see more held outside the pool, and raised again by every refusal. It only
+  // ever grows -- giving headroom back would hand away memory a measurement
+  // just proved another consumer needs.
+  std::atomic<size_t> free_limit_{0};
+  // What a caller asked the memory limit to be. A budget, not a fact about the
+  // device: `memory_limit()` honours it only down to what the reserve leaves.
+  // Atomic because `memory_limit()` is read from the refusal path, which must
+  // not take mutex_ -- the caller there may already hold it.
+  std::atomic<size_t> requested_limit_{0};
+  size_t total_memory_{0};
+  size_t max_pool_size_{0};
   BufferCache<CudaBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
-  // Device memory that must stay free after any allocation this allocator
-  // makes, because the consumers that need it cannot allocate from the pool:
-  // the CUDA context, NVRTC modules, cuDNN workspaces, instantiated graph
-  // executables. Seeded from what the device had already handed out before
-  // MLX allocated anything and raised by samples that see more held outside
-  // the pool. It only
-  // ever grows -- giving headroom back would hand away memory a measurement
-  // just proved another consumer needs.
-  std::atomic<size_t> foreign_reserve_{0};
   std::vector<CudaStream> free_streams_;
   std::vector<cudaMemPool_t> mem_pools_;
   SmallSizePool scalar_pool_;

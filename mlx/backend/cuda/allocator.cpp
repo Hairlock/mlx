@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace mlx::core {
@@ -148,18 +149,18 @@ CudaAllocator::CudaAllocator()
           [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
   size_t free = 0;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
-  // Memory the device has already handed to someone else -- the CUDA context
-  // above all -- is never ours to allocate, so a limit derived from the total
-  // alone is a limit that can never be reached. Clamp to what is actually
-  // free, and let the difference widen the reserve `free_limit_` protects.
-  // Nothing is ours yet, so everything the device has already handed out is
-  // the first measurement of the consumers that never allocate from this
-  // pool. Seeding the reserve with it is what keeps `set_memory_limit` and
-  // every later allocation from spending memory that was never ours.
-  foreign_reserve_.store(total_memory_ - free, std::memory_order_relaxed);
-  memory_limit_ = std::min(static_cast<size_t>(total_memory_ * 0.95), free);
-  free_limit_ = total_memory_ - memory_limit_;
-  max_pool_size_ = memory_limit_;
+  // Two floors, and the larger wins. What the device has already handed out is
+  // a direct measurement of the consumers that never allocate from this pool,
+  // and it is never ours to spend. A twentieth of the card is the historical
+  // reserve this allocator kept, and on a card where the context is small that
+  // is still the better starting guess for the graph executables and launch
+  // resources that appear later. The reserve only goes up from here.
+  free_limit_.store(
+      std::max(total_memory_ - free, total_memory_ / 20),
+      std::memory_order_relaxed);
+  requested_limit_.store(
+      std::numeric_limits<size_t>::max(), std::memory_order_relaxed);
+  max_pool_size_ = memory_limit();
 
   int device_count = gpu::device_count();
   free_streams_.resize(device_count);
@@ -213,7 +214,7 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   // the real footprint reach the limit twice over, which is how a run whose
   // limit was 37.75 GB peaked at 43.09 GB with 15.28 GB sitting in cache.
   if (!buf && device >= 0) {
-    while (active_memory_ + get_cache_memory() + size > memory_limit_ &&
+    while (active_memory_ + get_cache_memory() + size > memory_limit() &&
            scheduler::n_active_tasks() > 0) {
       lock.unlock();
       scheduler::wait_for_completion();
@@ -228,7 +229,7 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
   if (!buf) {
     // If we have a lot of memory pressure try to reclaim memory from the cache.
     int64_t mem_to_free =
-        get_active_memory() + get_cache_memory() + size - memory_limit_;
+        get_active_memory() + get_cache_memory() + size - memory_limit();
     if (mem_to_free > 0) {
       buffer_cache_.release_cached_buffers(mem_to_free);
     }
@@ -274,13 +275,22 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     // reserved figure this very condition tests is unchanged by the release.
     // Trimming is the step that turns the freed reservation back into device
     // memory a graph instantiation or a kernel's launch resources can use.
+    //
+    // This cap is the only thing in the allocator that decides how much of the
+    // card stays genuinely free, which makes `free_limit_` the figure the
+    // failure mode above actually turns on -- not the memory limit, not the
+    // cache limit. Measured on an L40S it had to be a measurement rather than
+    // the fixed twentieth of the card it used to be: the pool settled at
+    // exactly the memory limit in reserved pages with 4-15 GB of that idle,
+    // the device was left 1.79 GB free, and the next graph launch wanted more.
+    size_t reserve = free_limit_.load(std::memory_order_relaxed);
     for (auto p : mem_pools_) {
       if (p) {
         size_t reserved = 0;
         CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
             p, cudaMemPoolAttrReservedMemCurrent, &reserved));
-        if (reserved > (total_memory_ - free_limit_)) {
-          buffer_cache_.release_cached_buffers(free_limit_);
+        if (reserved > (total_memory_ - reserve)) {
+          buffer_cache_.release_cached_buffers(reserve);
           trim_pools();
           break;
         }
@@ -367,38 +377,57 @@ void CudaAllocator::trace_device_memory(
       reserved,
       used,
       foreign,
-      foreign_reserve_.load(std::memory_order_relaxed),
+      free_limit_.load(std::memory_order_relaxed),
       active_memory_,
       get_cache_memory(),
-      memory_limit_);
+      memory_limit());
 }
 
 void CudaAllocator::raise_reserve(size_t reserve) {
-  // Half the card bounds what a measurement is allowed to claim. A sample
-  // taken while another process holds most of the device would otherwise set a
-  // reserve that makes the precondition it feeds permanently unsatisfiable,
-  // turning every allocation into a release-and-trim no-op instead of
-  // backpressure.
+  // Half the card bounds what any single measurement may claim. Past that the
+  // pool cap it feeds leaves too little to train under, and a sample taken
+  // while another process holds most of the device would otherwise set a cap
+  // this allocator can never satisfy.
   reserve = std::min(reserve, total_memory_ / 2);
-  size_t current = foreign_reserve_.load(std::memory_order_relaxed);
+  size_t current = free_limit_.load(std::memory_order_relaxed);
   while (reserve > current &&
-         !foreign_reserve_.compare_exchange_weak(
+         !free_limit_.compare_exchange_weak(
              current, reserve, std::memory_order_relaxed)) {
   }
 }
 
 // A refusal is the one moment sampling can never reach on its own: a sample
 // sees the out-of-pool allocations that succeeded, never the one that failed.
-// Take the device's split here, where it is the split that actually decided
-// the outcome. Deliberately no growth heuristic: an earlier version raised the
-// reserve by a fraction of itself on every refusal, and a failing step
-// produces thousands of them, so the reserve saturated within seconds and made
-// every subsequent allocation fall through the wait unconditionally. The size
-// the reserve should be is a measurement to read off this trace, not a number
-// to converge on by guessing.
+// It is also the only evidence that exists about how much free memory a graph
+// instantiation or a kernel's launch resources actually wanted, because that
+// demand never passes through this allocator at all. So treat it as the
+// measurement it is and widen the reserve, which lowers the cap on what the
+// pool may keep reserved, so the next trim hands the difference back to the
+// device and the retry finds the room this attempt did not.
+//
+// An earlier version of this grew the reserve the same way and ran away
+// instead of converging, because the only thing the reserve fed back then was
+// a precondition in `wait_for_physical_memory` that the pool's idle
+// reservation short-circuited -- the raises never freed a byte, so they never
+// stopped. Growth converges only when each step actually moves memory.
+//
+// The step is taken from what the device had free at the refusal rather than
+// from the reserve's own previous value, because that is the quantity the
+// failed allocation just proved insufficient -- it wanted more than |free| and
+// did not get it. Compounding the reserve instead would make the size of the
+// raise depend on how many refusals happened to arrive before the next trim,
+// and a failing step produces them in bursts of thousands; anchoring it to a
+// measurement makes a burst converge on one answer instead of exponentiating
+// through it.
 void CudaAllocator::report_out_of_memory() {
   static std::atomic<size_t> seen{0};
   trace_device_memory("refused", seen, 0);
+  size_t free = 0;
+  size_t total = 0;
+  if (cudaMemGetInfo(&free, &total) != cudaSuccess) {
+    return;
+  }
+  raise_reserve(free + free / 4 + page_size);
 }
 
 // Report what the device can still hand out, keeping the two kinds of room
@@ -444,7 +473,7 @@ void CudaAllocator::wait_for_physical_memory(size_t size, int device) {
   auto servable = [this, device, size]() {
     auto avail = observe_device_memory(device);
     return avail.pooled >= size ||
-        avail.free >= size + foreign_reserve_.load(std::memory_order_relaxed);
+        avail.free >= size + free_limit_.load(std::memory_order_relaxed);
   };
   while (!servable() && scheduler::n_active_tasks() > 0) {
     {
@@ -555,24 +584,27 @@ void CudaAllocator::reset_peak_memory() {
   peak_memory_ = 0;
 }
 
-size_t CudaAllocator::get_memory_limit() {
-  return memory_limit_;
+// Derived rather than stored, because the reserve it is measured against
+// moves. A caller asking for a limit is expressing a budget, not a fact about
+// the device: honour it only down to what the device has actually left us,
+// otherwise a framework that computes its ceiling from the device total spends
+// the reserve and gets back the out-of-memory the reserve exists to prevent.
+size_t CudaAllocator::memory_limit() const {
+  size_t reserve = free_limit_.load(std::memory_order_relaxed);
+  size_t bound = total_memory_ > reserve ? total_memory_ - reserve : 0;
+  return std::min(requested_limit_.load(std::memory_order_relaxed), bound);
 }
 
-// A caller asking for a limit is expressing a budget, not a fact about the
-// device. Honour it only down to what the device has actually left us: a
-// framework that computes its ceiling from the device total would otherwise
-// undo the constructor's clamp and spend the reserve, and get back the
-// out-of-memory the reserve exists to prevent. Returns the limit that was in
-// force.
+size_t CudaAllocator::get_memory_limit() {
+  return memory_limit();
+}
+
+// Returns the limit that was in force.
 size_t CudaAllocator::set_memory_limit(size_t limit) {
   std::lock_guard lock(mutex_);
-  size_t reserve = foreign_reserve_.load(std::memory_order_relaxed);
-  size_t bound = total_memory_ > reserve ? total_memory_ - reserve : 0;
-  limit = std::min(limit, bound);
-  std::swap(limit, memory_limit_);
-  free_limit_ = total_memory_ - memory_limit_;
-  return limit;
+  size_t previous = memory_limit();
+  requested_limit_.store(limit, std::memory_order_relaxed);
+  return previous;
 }
 
 size_t CudaAllocator::get_cache_memory() const {
