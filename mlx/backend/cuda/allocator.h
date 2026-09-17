@@ -8,7 +8,6 @@
 
 #include <cuda_runtime.h>
 #include <atomic>
-#include <limits>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -95,10 +94,6 @@ class CudaAllocator : public allocator::Allocator {
   // card. Lock-free: the reserve only ever grows, so a lost race is a sample
   // another will retake.
   void raise_reserve(size_t reserve);
-  // Lower `pool_ceiling_` to |ceiling| if it is smaller. Lock-free for the same
-  // reason as `raise_reserve`, in the opposite direction: the ceiling only ever
-  // falls, so a lost race is a measurement another fallthrough will retake.
-  void lower_pool_ceiling(size_t ceiling);
   // Print the device-side memory split to stderr under MLX_CUDA_MEMORY_TRACE.
   // Non-throwing and rate-limited -- the first 32 events then every 256th --
   // because it runs on paths a failing run reaches thousands of times. |seen|
@@ -137,29 +132,6 @@ class CudaAllocator : public allocator::Allocator {
   // Atomic because `memory_limit()` is read from the refusal path, which must
   // not take mutex_ -- the caller there may already hold it.
   std::atomic<size_t> requested_limit_{0};
-  // The largest footprint the pool has actually serviced, and the ceiling
-  // learned from it.
-  //
-  // `total_memory_ - free_limit_` is what the card holds, but it is not what
-  // this allocator can spend, because the pool reserves far more than it
-  // serves and never gives the difference back: measured, `cudaMemPoolTrimTo`
-  // released zero bytes on all of twenty thousand calls, including ones taken
-  // with 23 GB idle inside a 44.56 GB reservation. That reservation is a fixed
-  // pot -- it reaches its ceiling before the first training step and stays
-  // byte-identical for the rest of the run -- and the gap between it and
-  // `active_memory_ + cache` is stream-bound idle blocks and fragmentation
-  // this allocator can neither name nor reclaim.
-  //
-  // So the ceiling is measured rather than computed. Every allocation the pool
-  // serves raises `serviced_peak_`; a fallthrough -- every task drained, all
-  // cache handed back, pool trimmed, and the device still below its reserve --
-  // is proof the pot is exhausted, and lowers `pool_ceiling_` to the peak that
-  // was serviced before it. Past that point the wait loop applies backpressure
-  // instead of letting the footprint ratchet up into an allocation the pot
-  // cannot cover. The ceiling only falls, because a fallthrough is evidence
-  // about the device that a later quiet moment does not undo.
-  std::atomic<size_t> serviced_peak_{0};
-  std::atomic<size_t> pool_ceiling_{std::numeric_limits<size_t>::max()};
   size_t total_memory_{0};
   size_t max_pool_size_{0};
   BufferCache<CudaBuffer> buffer_cache_;
