@@ -28,6 +28,14 @@ const char* cccl_dir() {
 #endif
 }
 
+const char* cutlass_dir() {
+#if defined(MLX_CUTLASS_DIR)
+  return MLX_CUTLASS_DIR;
+#else
+  return nullptr;
+#endif
+}
+
 const char* cuda_bin_dir() {
 #if defined(MLX_CUDA_BIN_DIR)
   static const std::string dir = resolve_bin_dir(MLX_CUDA_BIN_DIR);

@@ -321,3 +321,10 @@ install(DIRECTORY ${cutlass_SOURCE_DIR}/include/cute
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY ${cutlass_SOURCE_DIR}/include/cutlass
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Same reason as MLX_CCCL_DIR above: the test binary is not installed, so every
+# JIT-compiled quantized kernel it reaches would fail to find cute/.
+if(MLX_BUILD_TESTS)
+  target_compile_definitions(
+    mlx_dirs PRIVATE MLX_CUTLASS_DIR="${cutlass_SOURCE_DIR}/include")
+endif()

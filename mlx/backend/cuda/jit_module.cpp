@@ -18,6 +18,7 @@ namespace mlx::core::cu {
 
 // Defined in dirs.cpp to avoid invalidating compile cache.
 const char* cccl_dir();
+const char* cutlass_dir();
 
 namespace {
 
@@ -83,6 +84,15 @@ const std::vector<std::string>& include_path_args() {
     }
     if (std::filesystem::exists(path)) {
       args.push_back(fmt::format("--include-path={}", path.string()));
+    }
+    // Add path to CUTLASS headers. An installed tree has cute/ directly under
+    // include/, already covered above; a build tree has no include/ at all, and
+    // the test binary is never installed — so without this every JIT-compiled
+    // quantized kernel is unreachable from the C++ tests, which is precisely
+    // where they most need to be exercised.
+    if (auto* cutlass = cutlass_dir();
+        cutlass && std::filesystem::exists(cutlass)) {
+      args.push_back(fmt::format("--include-path={}", cutlass));
     }
     // Add path to CUDA runtime headers, try local-installed python package
     // first and then system-installed headers.
