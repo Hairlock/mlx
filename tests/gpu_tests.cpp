@@ -560,6 +560,13 @@ TEST_CASE("test memory info") {
 
   // Query active and peak memory
   {
+    // A cache is not something every backend keeps by default. The CUDA
+    // allocator holds none, because a freed block stays in its reserved pool
+    // and a second cache of the same bytes only makes the limit count them
+    // twice. Asking for one explicitly is what the contract guarantees, so
+    // set the limit the caching being asserted below depends on.
+    auto old_limit = set_cache_limit(1 << 20);
+
     auto a = zeros({4096});
     eval(a);
     synchronize();
@@ -577,6 +584,8 @@ TEST_CASE("test memory info") {
 
     auto cache_mem = get_cache_memory();
     CHECK(cache_mem >= 4096 * 4);
+
+    set_cache_limit(old_limit);
   }
 
   clear_cache();
