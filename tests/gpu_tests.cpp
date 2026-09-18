@@ -712,3 +712,65 @@ TEST_CASE("test layer norm vjp bias grad race") {
   }
   CHECK(worst <= 1e-5);
 }
+
+// A sorted `gather_qmm` has to produce exactly what the same problem produces
+// unsorted. The sorted path is the only one that reorders the activations: it
+// packs each expert's contiguous run of rows into fixed-height tiles and zeroes
+// the rows a short run leaves over, so the cases worth naming are the ones that
+// stress that arithmetic — runs that do not divide the tile height, and experts
+// that no row routes to at all.
+//
+// Both sides run on the GPU so the comparison isolates the reordering rather
+// than the quantized kernel, which would otherwise differ from a CPU reference
+// by its accumulation order alone.
+TEST_CASE("test gpu sorted gather_qmm") {
+  auto check_counts = [](const std::vector<int>& counts) {
+    int experts = counts.size();
+    int k = 128;
+    int n = 256;
+
+    std::vector<uint32_t> idx;
+    for (int e = 0; e < experts; ++e) {
+      idx.insert(idx.end(), counts[e], static_cast<uint32_t>(e));
+    }
+    int pairs = idx.size();
+    auto rhs_indices = array(idx.data(), {pairs}, uint32);
+
+    auto wf = random::normal({experts, n, k}, float32);
+    auto wq = quantize(astype(wf, float16), 64, 4);
+    // One row per pair is the MoE regime this path exists for: every pair is
+    // its own one-row matmul when the indices are taken as they come.
+    auto x = random::normal({pairs, 1, k}, float32);
+    x = astype(x, float16);
+
+    auto call = [&](bool sorted) {
+      return gather_qmm(
+          x,
+          wq[0],
+          wq[1],
+          wq[2],
+          /* lhs_indices = */ std::nullopt,
+          rhs_indices,
+          /* transpose = */ true,
+          64,
+          4,
+          "affine",
+          sorted,
+          Device::gpu);
+    };
+
+    auto sorted = astype(call(true), float32);
+    auto unsorted = astype(call(false), float32);
+    eval(sorted, unsorted);
+    CHECK_EQ(sorted.shape(), unsorted.shape());
+    CHECK(allclose(sorted, unsorted, 1e-3, 1e-3, false, Device::cpu)
+              .item<bool>());
+  };
+
+  // Runs of 16 rows exactly fill the shortest tile; the +3 and the empty
+  // expert are the padding and the zero-length run.
+  check_counts({16, 19, 0, 16, 3, 32, 1, 17});
+  // Enough rows per expert to select the tallest tile, still ending short of
+  // a whole one.
+  check_counts({80, 65, 100, 75});
+}

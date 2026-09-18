@@ -222,6 +222,21 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
+  auto call_gather_qmm_rhs = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    gather_qmm_rhs(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
   auto call_qmv = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     gather_qmv(
@@ -239,7 +254,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   };
 
   if (can_use_qmm_sm80) {
-    if (can_use_qmv && (M * B < 8)) {
+    // Sorted right-hand indices let every expert's weights be read once per
+    // tile of rows rather than once per row, which is the difference between
+    // a few gigabytes and a few hundred of weight traffic on an MoE layer.
+    if (supports_gather_qmm_rhs(x, w, out, right_sorted_)) {
+      call_gather_qmm_rhs();
+    } else if (can_use_qmv && (M * B < 8)) {
       call_qmv();
     } else {
       call_qmm_sm80();
